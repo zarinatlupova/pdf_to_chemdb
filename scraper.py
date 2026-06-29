@@ -1,238 +1,509 @@
-
-"""
-Скрипт для извлечения данных о биологической активности молекул
-из научных PDF-статей. Собирает единую таблицу с данными.
-Выход: chem_data.csv
-"""
-
-import pdfplumber
 import re
+import uuid
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
+
+try:
+    import fitz
+except ImportError:
+    raise SystemExit("Установите PyMuPDF: pip install PyMuPDF")
+
 import pandas as pd
-import os
-import glob
-from collections import defaultdict
+
+# ------------------------------------------------------------
+# Пути и настройки
+# ------------------------------------------------------------
+ROOT = Path(__file__).resolve().parent
+PDF_FOLDER = ROOT / "pdfs"
+OUT_CSV = ROOT / "chem_data.csv"
+
+# Минимальный набор колонок
+COLUMNS = [
+    "record_id", "source_pdf", "source_doi", "source_page", "source_table",
+    "compound_id", "endpoint_raw", "value_raw", "unit_raw", "qualifier",
+    "target_raw", "target_std"
+]
+
+TARGET_DICT = {
+    "cb1": "CNR1", "cb2": "CNR2",
+    "mor": "OPRM1", "mop": "OPRM1", "mu": "OPRM1", "μ": "OPRM1",
+    "kappa": "OPRK1", "κ": "OPRK1", "kor": "OPRK1",
+    "delta": "OPRD1", "δ": "OPRD1", "dor": "OPRD1",
+    "nop": "OPRL1", "orl1": "OPRL1",
+    "npsr": "NPSR",
+    "herg": "KCNH2",
+    "l": "OPRM1", "d": "OPRD1", "j": "OPRK1",
+}
 
 
-# 1. Вспомогательные функции для извлечения чисел и очистки
+# ------------------------------------------------------------
+# Базовые утилиты
+# ------------------------------------------------------------
 
-def extract_number(cell):
-    """Извлекает первое число из строки (поддерживает float и int)."""
-    if cell is None:
-        return None
-    cell_str = str(cell).strip()
-    match = re.search(r'([\d.]+)', cell_str)
-    if match:
-        try:
-            return float(match.group(1))
-        except ValueError:
-            return None
-    return None
-
-def clean_text(t):
-    """Очищает текст от лишних пробелов и символов."""
-    if not t:
-        return ''
-    return re.sub(r'\s+', ' ', str(t)).strip()
+def new_record(**fields) -> Dict[str, Any]:
+    rec = {c: "" for c in COLUMNS}
+    rec["record_id"] = fields.pop("record_id", str(uuid.uuid4()))
+    rec.update(fields)
+    return rec
 
 
-# 2. Парсинг таблиц с активностями (Ki, IC50, EC50)
-
-def parse_activity_table(table, pdf_name):
-    """
-    Парсит одну таблицу, извлекая названия соединений и значения
-    для разных рецепторов. Возвращает список словарей.
-    """
-    if not table:
-        return []
-
-    # Поиск строки-заголовка по ключевым словам
-    header_row_idx = None
-    for i, row in enumerate(table):
-        if row and any(re.search(r'Ki|IC50|EC50|K_i|pKi|pIC50', str(cell), re.IGNORECASE) for cell in row):
-            header_row_idx = i
+def extract_meta(pdf_path: Path) -> Dict[str, str]:
+    doc = fitz.open(pdf_path)
+    meta = doc.metadata or {}
+    doc.close()
+    doi = ""
+    title = meta.get("title", "")
+    for candidate in (title, meta.get("subject", "")):
+        m = re.search(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", candidate or "", re.I)
+        if m:
+            doi = m.group(0)
             break
-    if header_row_idx is None:
-        # Если не нашли, возможно таблица без заголовка – пропускаем
-        return []
+    return {"doi": doi, "title": title}
 
-    headers = [clean_text(cell) for cell in table[header_row_idx]]
-    # Определяем индексы столбцов по ключевым словам
-    col_indices = {
-        'compound': None,
-        'mu': None,
-        'delta': None,
-        'kappa': None,
-        'orl1': None,
-        'clogp': None,
-        'selectivity': None,
-        'ec50': None,      # для функциональных тестов
-        'emax': None,
-        'ke': None
-    }
 
-    for idx, h in enumerate(headers):
-        h_lower = h.lower()
-        if re.search(r'compound|ligand|drug|name|number', h_lower):
-            col_indices['compound'] = idx
-        if re.search(r'μ|mu|mop|damgo', h_lower):
-            col_indices['mu'] = idx
-        if re.search(r'δ|delta|dop|naltrindole|dlt', h_lower):
-            col_indices['delta'] = idx
-        if re.search(r'κ|kappa|kop|u69|u-69', h_lower):
-            col_indices['kappa'] = idx
-        if re.search(r'orl1|nociceptin|nop', h_lower):
-            col_indices['orl1'] = idx
-        if re.search(r'clogp|logp|log p', h_lower):
-            col_indices['clogp'] = idx
-        if re.search(r'selectivity|ratio', h_lower):
-            col_indices['selectivity'] = idx
-        if re.search(r'ec50|ec 50', h_lower):
-            col_indices['ec50'] = idx
-        if re.search(r'emax|e max|% stim', h_lower):
-            col_indices['emax'] = idx
-        if re.search(r'ke|k e', h_lower):
-            col_indices['ke'] = idx
+def read_all_text(pdf_path: Path) -> str:
+    doc = fitz.open(pdf_path)
+    text = "\n".join(page.get_text() for page in doc)
+    doc.close()
+    return text
 
-    # Если не нашли compound, предположим первый столбец
-    if col_indices['compound'] is None:
-        col_indices['compound'] = 0
 
-    data = []
-    for row in table[header_row_idx+1:]:
-        if not row or all(cell is None or clean_text(cell) == '' for cell in row):
+# ------------------------------------------------------------
+# Извлечение таблиц: camelot + pdfplumber
+# ------------------------------------------------------------
+def fetch_tables(pdf_path: Path) -> List[Dict]:
+    out = []
+    try:
+        import camelot
+        tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="lattice")
+        for table in tables:
+            rows = table.df.values.tolist()
+            out.append({"page": table.page, "rows": rows})
+    except Exception:
+        pass
+
+    if not out:
+        try:
+            import pdfplumber
+            with pdfplumber.open(pdf_path) as pdf:
+                for i, page in enumerate(pdf.pages, 1):
+                    for table in page.extract_tables() or []:
+                        if table and len(table) > 1:
+                            out.append({"page": i, "rows": table})
+        except ImportError:
+            pass
+    return out
+
+
+def clean_cell(cell) -> str:
+    if cell is None:
+        return ""
+    return re.sub(r"\s+", " ", str(cell).replace("\n", " ")).strip()
+
+
+def parse_measurement(raw: str) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+    if not raw or not raw.strip():
+        return (None, None, None)
+    s = raw.strip()
+    op_match = re.match(r'^([><=~])\s*', s)
+    operator = op_match.group(1) if op_match else '='
+    if op_match:
+        s = s[op_match.end():].strip()
+    s = re.sub(r'\([^)]*\)', '', s)
+    s = re.sub(r'±\s*[\d.]+', '', s)
+    num_match = re.search(r'^([\d.]+(?:[eE][+-]?\d+)?)', s)
+    if not num_match:
+        return (None, None, operator)
+    num = float(num_match.group(1))
+    unit_part = s[num_match.end():].strip()
+    unit_match = re.search(r'^([µμu]?M|nM|μM|uM|mM|pM|fM|M|pX|log)', unit_part, re.I)
+    if unit_match:
+        unit = unit_match.group(1)
+        unit = unit.upper().replace("µ", "u").replace("μ", "u")
+        if unit in ["UM", "U M"]:
+            unit = "μM"
+        elif unit in ["NM", "N M"]:
+            unit = "nM"
+        elif unit in ["MM", "M M"]:
+            unit = "mM"
+        elif unit in ["PM", "P M"]:
+            unit = "pM"
+        elif unit in ["FM", "F M"]:
+            unit = "fM"
+        elif unit in ["PX", "P X"]:
+            unit = "pX"
+        else:
+            unit = unit
+    else:
+        unit = unit_part or None
+    return (num, unit, operator)
+
+
+def standardize_target(raw: str) -> str:
+    if not raw:
+        return ""
+    key = raw.lower().strip()
+    if key in TARGET_DICT:
+        return TARGET_DICT[key]
+    for suffix in (" receptor", " binding", "binding", "receptor"):
+        if key.endswith(suffix):
+            sub = key[:-len(suffix)].strip()
+            if sub in TARGET_DICT:
+                return TARGET_DICT[sub]
+    return key.upper() if key.isascii() and len(key) <= 6 else key
+
+
+# ------------------------------------------------------------
+# Парсеры
+# ------------------------------------------------------------
+def parse_fulton2008(pdf_path: Path) -> List[Dict]:
+    records = []
+    meta = extract_meta(pdf_path)
+    for tbl in fetch_tables(pdf_path):
+        merged = " ".join(clean_cell(c) for row in tbl["rows"] for c in row)
+        if "Ki" not in merged:
             continue
+        for m in re.finditer(
+                r"(\d+[a-z](?:\([^)]+\))?|[A-Z]+-\d+)\s+"
+                r"([\d.]+)(?:[±+\-]\s*([\d.]+))?\s+"
+                r"([\d.]+)(?:[±+\-]\s*([\d.]+))?\s+"
+                r"([\d.]+)(?:[±+\-]\s*([\d.]+))?",
+                merged,
+        ):
+            comp, ki_l, sem_l, ki_d, sem_d, ki_k, sem_k = m.groups()
+            for target, val in (("l", ki_l), ("d", ki_d), ("j", ki_k)):
+                if not val:
+                    continue
+                num, unit, op = parse_measurement(val)
+                if num is None:
+                    continue
+                records.append(new_record(
+                    source_pdf=pdf_path.name, source_doi=meta["doi"],
+                    source_page=tbl["page"], source_table="Table 1",
+                    compound_id=comp,
+                    endpoint_raw="Ki",
+                    value_raw=num, unit_raw=unit, qualifier=op,
+                    target_raw=target, target_std=standardize_target(target)
+                ))
+    # fallback
+    if not records:
+        text = read_all_text(pdf_path)
+        # ищем любые числа с nM
+        for m in re.finditer(r"(MCL-\d+)\s+.*?([\d.]+)\s*nM", text):
+            comp, val = m.groups()
+            num, unit, op = parse_measurement(val)
+            if num is None:
+                continue
+            records.append(new_record(
+                source_pdf=pdf_path.name, source_doi=meta["doi"],
+                source_page="", source_table="prose",
+                compound_id=comp,
+                endpoint_raw="Ki",
+                value_raw=num, unit_raw="nM", qualifier=op,
+                target_raw="l", target_std="OPRM1"
+            ))
+    return records
 
-        compound = clean_text(row[col_indices['compound']]) if col_indices['compound'] < len(row) else ''
-        if not compound:
+
+def parse_yang2009(pdf_path: Path) -> List[Dict]:
+    records = []
+    meta = extract_meta(pdf_path)
+    for tbl in fetch_tables(pdf_path):
+        merged = " ".join(clean_cell(c) for row in tbl["rows"] for c in row)
+        compact = merged.replace(" ", "")
+        if "NOPKi" not in compact and "NOP Ki" not in merged:
             continue
+        ranges = [(14, 25, 1), (41, 47, 2), (26, 32, 3), (33, 40, 4), (47, 50, 5)]
+        for min_id, max_id, table_num in ranges:
+            for m in re.finditer(
+                    r"\b(\d{1,2})\s+([A-Za-z0-9,\-]+(?:\s+[A-Za-z0-9,\-]+)?)\s+([\d.]+|>1000|nd)\s+([\d.]+|>1000|nd)?",
+                    merged,
+            ):
+                comp_id, subst, nop_val, mop_val = m.groups()
+                cid = int(comp_id)
+                if cid < min_id or cid > max_id:
+                    continue
+                label = f"{comp_id} ({subst.strip()})"
+                for target, val in (("NOP", nop_val), ("MOP", mop_val)):
+                    if not val or val == "nd":
+                        continue
+                    num, unit, op = parse_measurement(val)
+                    if num is None:
+                        continue
+                    records.append(new_record(
+                        source_pdf=pdf_path.name, source_doi=meta["doi"],
+                        source_page=tbl["page"], source_table=f"Table {table_num}",
+                        compound_id=label,
+                        endpoint_raw="Ki",
+                        value_raw=num, unit_raw=unit, qualifier=op,
+                        target_raw=target, target_std=standardize_target(target)
+                    ))
+    return records
 
-        # Извлекаем числа для каждого рецептора
-        mu = extract_number(row[col_indices['mu']]) if col_indices['mu'] is not None and col_indices['mu'] < len(row) else None
-        delta = extract_number(row[col_indices['delta']]) if col_indices['delta'] is not None and col_indices['delta'] < len(row) else None
-        kappa = extract_number(row[col_indices['kappa']]) if col_indices['kappa'] is not None and col_indices['kappa'] < len(row) else None
-        orl1 = extract_number(row[col_indices['orl1']]) if col_indices['orl1'] is not None and col_indices['orl1'] < len(row) else None
-        clogp = extract_number(row[col_indices['clogp']]) if col_indices['clogp'] is not None and col_indices['clogp'] < len(row) else None
-        ec50 = extract_number(row[col_indices['ec50']]) if col_indices['ec50'] is not None and col_indices['ec50'] < len(row) else None
-        emax = extract_number(row[col_indices['emax']]) if col_indices['emax'] is not None and col_indices['emax'] < len(row) else None
-        ke = extract_number(row[col_indices['ke']]) if col_indices['ke'] is not None and col_indices['ke'] < len(row) else None
 
-        # Если нет никаких данных по активности – пропускаем
-        if all(v is None for v in [mu, delta, kappa, orl1, ec50, ke]):
+def parse_dolle2009(pdf_path: Path) -> List[Dict]:
+    records = []
+    meta = extract_meta(pdf_path)
+    for tbl in fetch_tables(pdf_path):
+        merged = " ".join(clean_cell(c) for row in tbl["rows"] for c in row)
+        if "Ki(nM)" not in merged:
             continue
+        for m in re.finditer(
+                r"\b(\d{1,2})\s+([\d.]+|c)\s+([\d.]+|c)\s+([\d.]+|c)\s+([\d.]+|c)?\s+([\d.]+|c)?\s+([\d.]+|c)?\s+([\d.]+|c)?",
+                merged,
+        ):
+            comp, ki_j, ki_l, ki_d, ic50_j, ic50_l, ic50_d, _ = m.groups()
+            if int(comp) > 22:
+                continue
+            for target, val in (("j", ki_j), ("l", ki_l), ("d", ki_d)):
+                if not val or val == "c":
+                    continue
+                num, unit, op = parse_measurement(val)
+                if num is None:
+                    continue
+                records.append(new_record(
+                    source_pdf=pdf_path.name, source_doi=meta["doi"],
+                    source_page=tbl["page"], source_table="Table 1",
+                    compound_id=comp,
+                    endpoint_raw="Ki",
+                    value_raw=num, unit_raw=unit, qualifier=op,
+                    target_raw=target, target_std=standardize_target(target)
+                ))
+    if not records:
+        text = read_all_text(pdf_path)
+        for m in re.finditer(r"compound\s+(\d+)\s+.*?([\d.]+)\s*nM", text):
+            comp, val = m.groups()
+            num, unit, op = parse_measurement(val)
+            if num is None:
+                continue
+            records.append(new_record(
+                source_pdf=pdf_path.name, source_doi=meta["doi"],
+                source_page="", source_table="prose",
+                compound_id=comp,
+                endpoint_raw="Ki",
+                value_raw=num, unit_raw="nM", qualifier=op,
+                target_raw="l", target_std="OPRM1"
+            ))
+    return records
 
-        data.append({
-            'compound': compound,
-            'mu_ki': mu,
-            'delta_ki': delta,
-            'kappa_ki': kappa,
-            'orl1_ki': orl1,
-            'clogp': clogp,
-            'ec50': ec50,
-            'emax': emax,
-            'ke': ke,
-            'source_pdf': pdf_name
-        })
-    return data
+
+def parse_kobayashi2009(pdf_path: Path) -> List[Dict]:
+    records = []
+    meta = extract_meta(pdf_path)
+    for tbl in fetch_tables(pdf_path):
+        merged = " ".join(clean_cell(c) for row in tbl["rows"] for c in row)
+        if "ORL1" not in merged:
+            continue
+        for m in re.finditer(
+                r"\b(\d{1,2})\s+(?:[^\d]{0,20}\s+)?([\d.]+|>1000)\s+([\d.]+|>1000)?\s*([\d.]+|>1000)?",
+                merged,
+        ):
+            comp, v1, v2, v3 = m.groups()
+            if int(comp) > 31:
+                continue
+            val = v1
+            if not val:
+                continue
+            q = ">" if str(val).startswith(">") else ""
+            val_clean = str(val).replace(">1000", "1000").lstrip(">")
+            num, unit, op = parse_measurement(val_clean)
+            if num is None:
+                continue
+            records.append(new_record(
+                source_pdf=pdf_path.name, source_doi=meta["doi"],
+                source_page=tbl["page"], source_table=f"Table (p{tbl['page']})",
+                compound_id=comp,
+                endpoint_raw="IC50",
+                value_raw=num, unit_raw=unit, qualifier=q or op,
+                target_raw="ORL1", target_std=standardize_target("ORL1")
+            ))
+    return records
 
 
-# 3. Основная функция обработки всех PDF
+def parse_iyer2012(pdf_path: Path) -> List[Dict]:
+    records = []
+    meta = extract_meta(pdf_path)
+    text = read_all_text(pdf_path)
+    patterns = [
+        r"compound\s+(\d+[a-z]?)\s+.*?Ki\s*[=¼]\s*([\d.]+)\s*nM",
+        r"(\d+[a-z]?)\s+\(Ki\s*[=¼]\s*([\d.]+)\s*nM\)",
+        r"(\d+[a-z]?)\s+.*?Ki\s*[=¼]\s*([\d.]+)\s*nM",
+        r"Ki\s*[=¼]\s*([\d.]+)\s*nM.*?(\d+[a-z]?) for the m",
+    ]
+    seen = set()
+    for pat in patterns:
+        for m in re.finditer(pat, text, re.I):
+            if len(m.groups()) == 2:
+                g1, g2 = m.groups()
+                if re.match(r"[\d.]+", g1):
+                    value, comp = g1, g2
+                else:
+                    comp, value = g1, g2
+            else:
+                continue
+            key = (comp.lower(), value)
+            if key in seen:
+                continue
+            seen.add(key)
+            num, unit, op = parse_measurement(value)
+            if num is None:
+                continue
+            records.append(new_record(
+                source_pdf=pdf_path.name, source_doi=meta["doi"],
+                source_page="", source_table="prose",
+                compound_id=comp,
+                endpoint_raw="Ki",
+                value_raw=num, unit_raw="nM", qualifier=op,
+                target_raw="m-opioid", target_std="OPRM1"
+            ))
+    return records
 
-def process_pdfs(pdf_folder='.'):
-    pdf_files = glob.glob(os.path.join(pdf_folder, '*.pdf'))
-    if not pdf_files:
-        print("PDF-файлы не найдены в папке:", pdf_folder)
+
+def parse_pettersson2009(pdf_path: Path) -> List[Dict]:
+    records = []
+    meta = extract_meta(pdf_path)
+    text = read_all_text(pdf_path)
+    # ищем pKi
+    for m in re.finditer(r"(12[jk])\s+.*?pKi\s*=\s*([\d.]+)", text):
+        comp, val = m.groups()
+        num, unit, op = parse_measurement(val)
+        if num is None:
+            continue
+        records.append(new_record(
+            source_pdf=pdf_path.name, source_doi=meta["doi"],
+            source_page="", source_table="prose",
+            compound_id=comp,
+            endpoint_raw="pKi",
+            value_raw=num, unit_raw="pX", qualifier=op,
+            target_raw="CB1", target_std="CNR1"
+        ))
+    # если ничего не нашли, ищем просто pIC50
+    if not records:
+        for m in re.finditer(r"(12[a-z])\s+.*?pIC50\s*=\s*([\d.]+)", text):
+            comp, val = m.groups()
+            num, unit, op = parse_measurement(val)
+            if num is None:
+                continue
+            records.append(new_record(
+                source_pdf=pdf_path.name, source_doi=meta["doi"],
+                source_page="", source_table="prose",
+                compound_id=comp,
+                endpoint_raw="pIC50",
+                value_raw=num, unit_raw="pX", qualifier=op,
+                target_raw="CB1", target_std="CNR1"
+            ))
+    return records
+
+
+def parse_guerrini2009(pdf_path: Path) -> List[Dict]:
+    records = []
+    meta = extract_meta(pdf_path)
+    text = read_all_text(pdf_path)
+    # ищем pKB
+    for m in re.finditer(r"\[tBu-D-Gly5\]NPS.*?pKB\s*=\s*([\d.]+)", text):
+        val = m.group(1)
+        num, unit, op = parse_measurement(val)
+        if num is None:
+            continue
+        records.append(new_record(
+            source_pdf=pdf_path.name, source_doi=meta["doi"],
+            source_page="", source_table="prose",
+            compound_id="[tBu-D-Gly5]NPS",
+            endpoint_raw="pKB",
+            value_raw=num, unit_raw="pX", qualifier=op,
+            target_raw="NPSR", target_std="NPSR"
+        ))
+    if not records:
+        for m in re.finditer(r"NPS\s+.*?pEC50\s*=\s*([\d.]+)", text):
+            val = m.group(1)
+            num, unit, op = parse_measurement(val)
+            if num is None:
+                continue
+            records.append(new_record(
+                source_pdf=pdf_path.name, source_doi=meta["doi"],
+                source_page="", source_table="prose",
+                compound_id="NPS",
+                endpoint_raw="pEC50",
+                value_raw=num, unit_raw="pX", qualifier=op,
+                target_raw="NPSR", target_std="NPSR"
+            ))
+    return records
+
+
+def parse_naltrexamine(pdf_path: Path) -> List[Dict]:
+    records = []
+    meta = extract_meta(pdf_path)
+    text = read_all_text(pdf_path)
+    # ищем Ki в тексте
+    for m in re.finditer(r"(\d+[a-z]?)\s+\(Ki\s*=\s*([\d.]+)\s*nM\)", text):
+        comp, val = m.groups()
+        num, unit, op = parse_measurement(val)
+        if num is None:
+            continue
+        records.append(new_record(
+            source_pdf=pdf_path.name, source_doi=meta["doi"],
+            source_page="", source_table="prose",
+            compound_id=comp,
+            endpoint_raw="Ki",
+            value_raw=num, unit_raw="nM", qualifier=op,
+            target_raw="MOR", target_std="OPRM1"
+        ))
+    return records
+
+
+# ------------------------------------------------------------
+# Главная функция
+# ------------------------------------------------------------
+def main():
+    if not PDF_FOLDER.exists():
+        PDF_FOLDER.mkdir(parents=True, exist_ok=True)
+        print(f"Папка {PDF_FOLDER} создана. Поместите PDF-файлы и запустите снова.")
         return
 
-    all_activity_data = []
+    pdfs = list(PDF_FOLDER.glob("*.pdf"))
+    if not pdfs:
+        print("В папке pdfs/ нет PDF-файлов.")
+        return
 
-    for pdf_path in pdf_files:
-        pdf_name = os.path.basename(pdf_path)
-        print(f'Обработка: {pdf_name}')
+    parser_map = {
+        "08008214": parse_fulton2008,
+        "09003679": parse_yang2009,
+        "09006222": parse_dolle2009,
+        "09006258": parse_kobayashi2009,
+        "02235234": parse_iyer2012,
+        "dibenzothiazep": parse_pettersson2009,
+        "neuropeptide": parse_guerrini2009,
+        "naltrexamine": parse_naltrexamine,
+    }
 
-        # Извлекаем таблицы
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                tables = page.extract_tables()
-                for table in tables:
-                    if table and len(table) > 1:
-                        parsed = parse_activity_table(table, pdf_name)
-                        all_activity_data.extend(parsed)
+    all_rows = []
+    for pdf in pdfs:
+        print(f"Обработка {pdf.name}...")
+        name = pdf.name.lower()
+        parser = None
+        for pattern, func in parser_map.items():
+            if pattern in name:
+                parser = func
+                break
+        if parser is None:
+            print(f"  Нет парсера для {pdf.name}, пропускаем.")
+            continue
+        records = parser(pdf)
+        all_rows.extend(records)
+        print(f"  Извлечено {len(records)} записей.")
 
+    if not all_rows:
+        print("Не извлечено ни одной записи.")
+        return
 
-    # 4. Формирование единой таблицы (денормализованной)
-
-    df_raw = pd.DataFrame(all_activity_data)
-
-    # Удаляем дубликаты по названию и источнику (оставляем первое вхождение)
-    df_raw = df_raw.drop_duplicates(subset=['compound', 'source_pdf'], keep='first')
-
-    # Фильтруем: оставляем только записи, где есть данные по хотя бы одному рецептору
-    df = df_raw.dropna(subset=['mu_ki', 'delta_ki', 'kappa_ki', 'orl1_ki', 'ec50', 'ke'], how='all')
-
-    # Присваиваем уникальный ID для каждой уникальной молекулы (по названию)
-    unique_molecules = df['compound'].unique()
-    mol_id_map = {name: f'MOL{str(i+1).zfill(3)}' for i, name in enumerate(unique_molecules)}
-    df['molecule_id'] = df['compound'].map(mol_id_map)
-
-
-    # 5. Создание единого списка записей
-
-    rows = []
-    for _, row in df.iterrows():
-        mid = row['molecule_id']
-        name = row['compound']
-        clogp = row['clogp']
-        pdf = row['source_pdf']
-
-        # Helper для добавления строки
-        def add_activity(target, assay_type, activity_type, value, efficacy=None, selectivity=None):
-            if pd.notna(value):
-                rows.append({
-                    'molecule_id': mid,
-                    'name': name,
-                    'smiles': '',  # можно заполнить отдельно
-                    'clogp': clogp,
-                    'target': target,
-                    'assay_type': assay_type,
-                    'activity_type': activity_type,
-                    'value': value,
-                    'units': 'nM',
-                    'efficacy': efficacy,
-                    'selectivity_ratio': selectivity,
-                    'source_pdf': pdf
-                })
-
-        # Ki для μ
-        add_activity('μ opioid receptor', 'binding', 'Ki', row['mu_ki'])
-        # Ki для δ
-        add_activity('δ opioid receptor', 'binding', 'Ki', row['delta_ki'])
-        # Ki для κ
-        add_activity('κ opioid receptor', 'binding', 'Ki', row['kappa_ki'])
-        # Ki для ORL1
-        add_activity('ORL1', 'binding', 'Ki', row['orl1_ki'])
-        # EC50 (по умолчанию считаем, что это μ, если не указано иное)
-        if pd.notna(row['ec50']):
-            add_activity('μ opioid receptor', 'functional', 'EC50', row['ec50'], efficacy=row.get('emax'))
-        # Ke (по умолчанию μ)
-        if pd.notna(row['ke']):
-            add_activity('μ opioid receptor', 'functional', 'Ke', row['ke'])
-
-    df_out = pd.DataFrame(rows)
-
-    # Удаляем дубликаты (могут быть, если одна активность попала дважды)
-    df_out = df_out.drop_duplicates()
-
-    # Сортируем для удобства
-    df_out = df_out.sort_values(['molecule_id', 'target', 'activity_type'])
-
-    # Сохраняем
-    df_out.to_csv('chem_data.csv', index=False, encoding='utf-8')
-    print(f"\n✅ Обработка завершена. Создан файл chem_data.csv с {len(df_out)} записями.")
-
-    return df_out
+    df = pd.DataFrame(all_rows)
+    for c in COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[COLUMNS]
+    df.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
+    print(f"База данных сохранена: {OUT_CSV} ({len(all_rows)} записей)")
 
 
-# 6. Запуск
-
-if __name__ == '__main__':
-    process_pdfs(pdf_folder='pdfs')
+if __name__ == "__main__":
+    main()
